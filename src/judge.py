@@ -24,6 +24,7 @@ load_dotenv(ROOT / ".env")
 
 VERDICTS = ("understood", "partial", "wrong")
 TEXT_FIELDS = ("got_right", "missed", "hint")
+DEFAULT_VERSION = "v2"      # v1 is kept so the two prompts can be compared (notebook 05)
 
 PROMPTS = {
     "v1": (
@@ -98,7 +99,8 @@ def call_llm(system, user, retries=4):
     for attempt in range(retries):
         try:
             r = requests.post(base.rstrip("/") + "/chat/completions",
-                              headers={"Authorization": f"Bearer {key}"}, json=body, timeout=120)
+                              headers={"Authorization": f"Bearer {key}"}, json=body,
+                              timeout=float(os.environ.get("LLM_TIMEOUT", 120)))
         except (requests.Timeout, requests.ConnectionError):
             status = "timeout or connection error"
             time.sleep(2 ** attempt * 2)
@@ -109,7 +111,13 @@ def call_llm(system, user, retries=4):
             continue
         if not r.ok:
             raise RuntimeError(f"LLM request failed: {r.status_code} {r.text[:200]}")
-        return r.json()["choices"][0]["message"]["content"]
+        try:
+            content = r.json()["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"unexpected API response: {type(e).__name__}")
+        if not isinstance(content, str):
+            raise ValueError("API reply has no text content")
+        return content
     raise RuntimeError(f"LLM request failed after {retries} tries (last status: {status})")
 
 
@@ -123,19 +131,21 @@ def parse_json(text):
 
 
 def validate(d):
-    """Check the reply has a valid verdict and the three feedback texts."""
+    """Check the reply is a JSON object with a valid verdict and three non-empty feedback texts."""
+    if not isinstance(d, dict):
+        raise ValueError("reply is not a JSON object")
     verdict = str(d.get("verdict", "")).strip().lower()
     if verdict not in VERDICTS:
         raise ValueError(f"bad verdict: {d.get('verdict')!r}")
     out = {"verdict": verdict}
     for k in TEXT_FIELDS:
-        if not isinstance(d.get(k), str):
-            raise ValueError(f"missing or non-text field: {k}")
+        if not isinstance(d.get(k), str) or not d[k].strip():
+            raise ValueError(f"missing or empty field: {k}")
         out[k] = d[k].strip()
     return out
 
 
-def judge_one(explanation_id, lesson_id, text, lessons, version="v1"):
+def judge_one(explanation_id, lesson_id, text, lessons, version=DEFAULT_VERSION):
     """Judge one explanation. Returns explanation_id, verdict, got_right, missed, hint."""
     system, template = PROMPTS[version]
     user = template.replace("{lesson}", lessons[lesson_id]).replace("{explanation}", text)
@@ -150,7 +160,7 @@ def judge_one(explanation_id, lesson_id, text, lessons, version="v1"):
             "hint": "", "error": str(last_err)}
 
 
-def run_batch(df, version="v1", out_path=None, delay=None):
+def run_batch(df, version=DEFAULT_VERSION, out_path=None, delay=None):
     """Judge every row of df (needs explanation_id, lesson_id, explanation_text).
 
     Results are appended to a .jsonl file as they arrive, so a crash or rate limit
@@ -185,7 +195,7 @@ def run_batch(df, version="v1", out_path=None, delay=None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Judge a few explanations and print the JSON")
     ap.add_argument("--n", type=int, default=3, help="how many explanations to judge")
-    ap.add_argument("--version", default="v1", help="prompt version")
+    ap.add_argument("--version", default=DEFAULT_VERSION, help="prompt version (v1 simple, v2 improved)")
     args = ap.parse_args()
     expl = pd.read_csv(ROOT / "data" / "clean" / "explanations_clean.csv").head(args.n)
     lessons = load_lessons()
